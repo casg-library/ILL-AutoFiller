@@ -1,0 +1,536 @@
+// ==UserScript==
+// @name         WorldCat → ILL Request Autofill
+// @namespace    worldcat-ill-autofill
+// @version      1.9
+// @match        https://search.worldcat.org/title/*
+// @match        http://192.168.20.77/webforms/request/staff_form.aspx
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  console.log('[ILL-autofill] script loaded on', location.hostname);
+
+  const FORM_URL = 'http://192.168.20.77/webforms/request/staff_form.aspx';
+
+  // @grant none means we already run in page context, but be explicit so this
+  // keeps working if a future @grant flips us into Tampermonkey's sandbox —
+  // ASP.NET's Page_Validators etc. live on the PAGE window, not ours.
+  const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+  // Payload travels in the URL hash instead of shared storage (kills the
+  // double-click race — each tab is self-contained, see v1.5 notes).
+  //
+  // IMPORTANT: we deliberately do NOT read __NEXT_DATA__ for book data.
+  // Confirmed empirically (2026-07-16) by diffing its textContent across two
+  // client-side navigations in the same tab: it was byte-for-byte identical
+  // before and after, even though the visible page had fully updated to a
+  // different title. That DOM node is a one-time SSR snapshot from the tab's
+  // first hard load — Next.js's router never rewrites it on soft navigation.
+  // The rendered page IS correct after a soft nav, so we scrape that instead.
+
+  // ---------- WorldCat page ----------
+  if (location.hostname === 'search.worldcat.org') {
+    let btn = null;
+    let lastPath = null;
+    let initGen = 0; // guards against a stale retry chain overwriting a newer one
+
+    function joinNames(names) {
+      if (names.length === 0) return '';
+      if (names.length === 1) return names[0];
+      if (names.length === 2) return names[0] + ' and ' + names[1];
+      return names.slice(0, -1).join(', ') + ', and ' + names[names.length - 1];
+    }
+
+    // WorldCat tags every credited person the same way (a[href*="/search?q=au"]) —
+    // a book's co-authors, a film's director/writers/full cast, and a narrator
+    // all use this identical link pattern. A DVD box set can carry 50+ of them.
+    // Confirmed live on "The Matrix 4-film déjà vu collection": 50 credited
+    // people, roles annotated in the sibling text as e.g.
+    // " (Creator, Film director, Screenwriter, Film producer)" or " (Actor)".
+    // So: prefer directors for video, prefer authors/editors for books, and
+    // only fall back to "just take the first name" rather than ever joining
+    // an entire cast list.
+    function extractAuthor() {
+      const links = Array.from(document.querySelectorAll('a[href*="/search?q=au"]'));
+      if (links.length === 0) return '';
+      if (links.length === 1) return links[0].textContent.trim();
+
+      const people = links.map((a) => {
+        const roleText = a.nextSibling ? a.nextSibling.textContent : '';
+        const roleMatch = roleText.match(/\(([^)]*)\)/);
+        const roles = roleMatch ? roleMatch[1].split(',').map((r) => r.trim().toLowerCase()) : [];
+        return { name: a.textContent.trim(), roles };
+      });
+
+      const directors = people.filter((p) => p.roles.some((r) => r.includes('director')));
+      if (directors.length > 0) return joinNames(directors.map((p) => p.name));
+
+      const creators = people.filter((p) => p.roles.some((r) => r === 'author' || r === 'editor' || r === 'creator'));
+      if (creators.length > 0) return joinNames(creators.map((p) => p.name));
+
+      // Nothing matched a known creator role (e.g. a page with no role
+      // annotations at all, or only narrator/cast credits) — don't guess by
+      // joining everyone, just take the first credited person.
+      return people[0].name;
+    }
+
+    // v1.9: the h1 contains a collapsed-text toggle ("Show more") that was
+    // riding into the ILL record as part of the title. Strip interactive
+    // children first, then belt-and-suspenders the leftover text.
+    function extractTitle() {
+      const h1 = document.querySelector('h1');
+      if (!h1) return '';
+      const clone = h1.cloneNode(true);
+      clone.querySelectorAll('button, [role="button"], a').forEach((n) => n.remove());
+      return clone.textContent
+        .replace(/\s*Show\s+(more|less)\s*$/i, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function extractRecord() {
+      const title = extractTitle();
+      if (!title) {
+        console.log('[ILL-autofill] no h1 yet');
+        return null;
+      }
+
+      const author = extractAuthor();
+
+      // The OCLC number the form wants is literally the URL's path segment.
+      const isbn = location.pathname.split('/').filter(Boolean).pop() || '';
+
+      // Publisher block renders as one text node: "Publisher: NAME, City, ST, YYYY"
+      // (segment count varies — sometimes no city/state at all).
+      let publisher = '';
+      let pubdate = '';
+      const pubLabel = Array.from(document.querySelectorAll('body *'))
+        .find((el) => el.children.length === 0 && el.textContent.includes('Publisher:'));
+      if (pubLabel) {
+        const raw = pubLabel.parentElement.textContent.replace(/^Publisher:\s*/, '').trim();
+
+        // v1.9: the old /(\d{4})\s*$/ died on a trailing period ("..., 2019.")
+        // and would happily bite the last 4 digits off a long number. Anchor
+        // on digit boundaries, tolerate trailing punctuation, and constrain
+        // to plausible years so we don't invent books from the 79th century.
+        const YEAR = /(?<!\d)(1[4-9]\d{2}|20\d{2})(?!\d)/;
+        const trailing = raw.match(new RegExp(YEAR.source + /\s*[.,;]?\s*$/.source));
+        let rest = raw;
+        if (trailing) {
+          pubdate = trailing[1];
+          rest = raw.slice(0, trailing.index);
+        } else {
+          // No year at the end — take the last plausible year anywhere, but
+          // leave the publisher string alone since we can't safely split it.
+          const all = raw.match(new RegExp(YEAR.source, 'g'));
+          if (all) pubdate = all[all.length - 1];
+        }
+        rest = rest.replace(/[\s,;.]+$/, '');
+
+        const parts = rest.split(',').map((s) => s.trim()).filter(Boolean);
+        // Keep a trailing corporate suffix (LLC, Inc, etc.) attached to the
+        // publisher name instead of letting the naive comma-split truncate it
+        // — e.g. "Stylus Publishing, LLC, Sterling, Virginia" must NOT become
+        // just "Stylus Publishing".
+        const suffixRe = /^(LLC|Inc\.?|Ltd\.?|Co\.?|Corp\.?|S\.A\.?|GmbH)$/i;
+        publisher = parts[0] || '';
+        if (parts[1] && suffixRe.test(parts[1])) publisher += ', ' + parts[1];
+      } else {
+        console.log('[ILL-autofill] no Publisher: label found on page yet');
+      }
+
+      const record = { title, author, publisher, pubdate, isbn };
+      console.log('[ILL-autofill] extracted record:', record);
+      return record;
+    }
+
+    function buildPayload(record) {
+      return {
+        title: record.title,
+        author: record.author,
+        publisher: record.publisher,
+        pubdate: record.pubdate,
+        isbn: record.isbn, // form field is labeled "ISBN/OCLC"
+      };
+    }
+
+    function ensureButton() {
+      if (btn) return;
+      console.log('[ILL-autofill] creating button');
+      btn = document.createElement('button');
+      btn.textContent = '📋 Send to ILL Form';
+      btn.style.cssText =
+        'position:fixed;top:80px;right:20px;z-index:99999;padding:10px 14px;' +
+        'background:#0078d4;color:#fff;border:none;border-radius:4px;' +
+        'font-size:14px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.3);';
+      document.body.appendChild(btn);
+    }
+
+    function wireButton(record) {
+      ensureButton();
+      btn.onclick = () => {
+        const payload = buildPayload(record);
+        const hash = encodeURIComponent(JSON.stringify(payload));
+        console.log('[ILL-autofill] opening form with payload:', payload);
+        window.open(FORM_URL + '#' + hash, '_blank');
+      };
+    }
+
+    function tryInit(attemptsLeft, gen, prevSnapshot) {
+      if (gen !== initGen) return; // a newer navigation superseded this attempt chain
+      const record = extractRecord();
+      const snapshot = record ? JSON.stringify(record) : null;
+      // Require two consecutive reads to agree before trusting them. This
+      // correctly handles BOTH cases without needing to guess timing:
+      //  - hard load: first read is already correct, but has nothing to
+      //    compare against yet (prevSnapshot is null) -> one extra 250ms
+      //    round-trip, then it matches itself and we proceed.
+      //  - soft nav: the old page's content may still be rendered for a
+      //    beat; that read won't match the next one, so we keep polling
+      //    until the DOM actually settles on the new page's content.
+      // (v1.6 tried to solve this by snapshotting "the old title" at the
+      // start of the navigation and waiting for it to change — but that
+      // snapshot was taken AFTER the page had already finished rendering
+      // on a hard load, so it snapshotted the correct value and then
+      // compared it to itself forever, permanently reading as "stale."
+      // That's the exact bug that made the button never appear at all.)
+      const stable = snapshot && snapshot === prevSnapshot;
+
+      if (stable) {
+        wireButton(record);
+        console.log('[ILL-autofill] button wired to current record');
+        return;
+      }
+
+      if (attemptsLeft > 0) {
+        setTimeout(() => tryInit(attemptsLeft - 1, gen, snapshot), 250);
+      } else if (record) {
+        // Never confirmed two matching reads, but we're out of attempts —
+        // better to show a possibly-imperfect button than none at all.
+        console.warn('[ILL-autofill] never confirmed stability, using last read anyway');
+        wireButton(record);
+      } else {
+        console.warn('[ILL-autofill] gave up, no record ever extracted');
+      }
+    }
+
+    function onRouteChange() {
+      if (location.pathname === lastPath) return;
+      lastPath = location.pathname;
+      initGen++;
+      console.log('[ILL-autofill] route change detected ->', location.pathname);
+      tryInit(15, initGen, null);
+    }
+
+    // Next.js (pages router) navigates via router.push/change, which bottoms out
+    // in history.pushState / replaceState as its last step — confirmed empirically
+    // via call-stack trace through er.changeState -> er.change -> pushState.
+    const origPushState = history.pushState;
+    history.pushState = function (...args) {
+      origPushState.apply(this, args);
+      onRouteChange();
+    };
+    const origReplaceState = history.replaceState;
+    history.replaceState = function (...args) {
+      origReplaceState.apply(this, args);
+      onRouteChange();
+    };
+    window.addEventListener('popstate', onRouteChange);
+
+    // Initial load (hard navigation / first visit)
+    window.addEventListener('load', onRouteChange);
+    if (document.readyState === 'complete') onRouteChange();
+  }
+
+  // ---------- ILL request form page ----------
+  if (location.hostname === '192.168.20.77') {
+    console.log('[ILL-autofill] on ILL form page');
+
+    // Set true to print the diagnostic dump on every fill. Leave it on until
+    // the pubdate validation problem is confirmed dead, then flip to false.
+    const DIAG = true;
+
+    // sessionStorage is per-TAB, so it does not reintroduce the v1.5
+    // cross-tab double-click race that killed shared storage. We need the
+    // payload to survive an ASP.NET postback (which reloads this page and
+    // does NOT carry the fragment along), so the hash alone isn't enough.
+    const SS_KEY = 'ill-autofill-payload';
+
+    const rawHash = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
+    let payload = null;
+
+    if (rawHash) {
+      try {
+        payload = JSON.parse(rawHash);
+        sessionStorage.setItem(SS_KEY, rawHash);
+        console.log('[ILL-autofill] payload from URL hash:', payload);
+      } catch (e) {
+        console.error('[ILL-autofill] bad hash data', e);
+      }
+    } else {
+      const stashed = sessionStorage.getItem(SS_KEY);
+      if (stashed) {
+        try {
+          payload = JSON.parse(stashed);
+          console.log('[ILL-autofill] payload restored from sessionStorage (postback?):', payload);
+        } catch (e) {
+          sessionStorage.removeItem(SS_KEY);
+        }
+      }
+    }
+
+    if (!payload) return;
+
+    const FIELDS = ['title', 'author', 'isbn', 'publisher', 'pubdate'];
+
+    // ASP.NET WebForms mangles control IDs when they sit inside a naming
+    // container: id="pubdate" becomes id="ctl00_MainContent_pubdate" and
+    // name="ctl00$MainContent$pubdate". A plain getElementById works today,
+    // but stops working the moment someone wraps the form in a new
+    // ContentPlaceHolder. Resolve defensively.
+    function findField(id) {
+      return (
+        document.getElementById(id) ||
+        document.querySelector('[id$="_' + id + '"]') ||
+        document.querySelector('[name="' + id + '"]') ||
+        document.querySelector('[name$="$' + id + '"]') ||
+        null
+      );
+    }
+
+    // Assigning .value directly is invisible to everything that matters:
+    // no input event, no change event, no blur. A masked-input widget or an
+    // ASP.NET validator never learns the value exists. Use the native setter
+    // (survives any framework that has monkeypatched the value property) and
+    // then announce it the way a human keyboard would.
+    function nativeSetValue(el, value) {
+      const proto =
+        el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(el, value);
+      else el.value = value;
+    }
+
+    function setVal(id, value, opts) {
+      opts = opts || {};
+      const el = findField(id);
+      if (!el) {
+        console.warn('[ILL-autofill] could not find field', id);
+        return false;
+      }
+      if (!value) {
+        console.warn('[ILL-autofill] empty value for', id, '- skipping');
+        return false;
+      }
+      // Never stomp something the user typed themselves. Only relevant on the
+      // post-postback re-fill pass.
+      if (opts.onlyIfEmpty && el.value && el.value.trim() !== '') return false;
+      if (el.value === value && opts.skipIfSame) return false;
+
+      try {
+        el.focus();
+      } catch (e) {
+        /* detached or unfocusable, keep going */
+      }
+      nativeSetValue(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      // A REAL blur, not a synthetic event — blur does not bubble, and
+      // WebForms widgets love hanging their "commit for real" logic on it.
+      try {
+        el.blur();
+      } catch (e) {
+        /* ignore */
+      }
+
+      syncCompanions(el, value);
+      console.log('[ILL-autofill] set', id, '=', value, '(resolved as', el.id || el.name, ')');
+      return true;
+    }
+
+    // Datepicker widgets (Telerik, AJAX Control Toolkit, jQuery UI) keep the
+    // value the server actually reads in a hidden companion input, not in the
+    // visible textbox. If one exists and is a plain empty string, mirror our
+    // value into it. If it holds JSON (Telerik ClientState), only touch the
+    // keys we recognise — blindly overwriting it makes things worse, not better.
+    function syncCompanions(el, value) {
+      const base = el.id || el.name;
+      if (!base) return;
+      const hidden = Array.from(document.querySelectorAll('input[type=hidden]')).filter(
+        (h) => (h.id && h.id.startsWith(base + '_')) || (h.name && h.name.startsWith(base + '_'))
+      );
+      hidden.forEach((h) => {
+        const cur = h.value == null ? '' : h.value.trim();
+        if (cur === '') {
+          h.value = value;
+          console.log('[ILL-autofill] mirrored into companion hidden field', h.id || h.name);
+          return;
+        }
+        if (cur.startsWith('{')) {
+          try {
+            const state = JSON.parse(cur);
+            let touched = false;
+            ['valueAsString', 'validationText', 'value', 'text'].forEach((k) => {
+              if (k in state) {
+                state[k] = value;
+                touched = true;
+              }
+            });
+            if (touched) {
+              h.value = JSON.stringify(state);
+              console.log('[ILL-autofill] patched ClientState on', h.id || h.name);
+            }
+          } catch (e) {
+            console.warn('[ILL-autofill] companion field holds unparseable JSON, left alone:', h.id || h.name);
+          }
+        }
+      });
+    }
+
+    // ASP.NET caches each validator's verdict in v.isvalid and only re-runs it
+    // when its own change handler fires. Force a re-evaluation so a validator
+    // that failed on an empty box updates now that the box is populated.
+    function refreshValidators() {
+      try {
+        if (!W.Page_Validators) return;
+        W.Page_Validators.forEach((v) => {
+          if (typeof W.ValidatorValidate === 'function') W.ValidatorValidate(v, null, null);
+        });
+        if (typeof W.ValidatorUpdateIsValid === 'function') W.ValidatorUpdateIsValid();
+        console.log('[ILL-autofill] re-ran client validators');
+      } catch (e) {
+        console.warn('[ILL-autofill] validator refresh failed (harmless)', e);
+      }
+    }
+
+    function diagnose(tag) {
+      if (!DIAG) return;
+      const el = findField('pubdate');
+      console.log(
+        '[ILL-diag ' + tag + '] pubdate:',
+        el
+          ? {
+              matchesById: document.querySelectorAll('#pubdate').length,
+              resolvedId: el.id,
+              name: el.name,
+              value: el.value,
+              disabled: el.disabled,
+              readOnly: el.readOnly,
+              inForm: !!el.form,
+              maxLength: el.maxLength,
+            }
+          : 'NOT FOUND'
+      );
+      console.log(
+        '[ILL-diag ' + tag + '] hidden date-ish fields:',
+        Array.from(document.querySelectorAll('input[type=hidden]'))
+          .filter((i) => /date|pub/i.test((i.name || '') + (i.id || '')))
+          .map((i) => [i.name || i.id, i.value])
+      );
+      if (W.Page_Validators) {
+        console.log(
+          '[ILL-diag ' + tag + '] validators:',
+          W.Page_Validators.map((v) => ({
+            id: v.id,
+            validates: v.controltovalidate,
+            valid: v.isvalid,
+            msg: v.errormessage,
+          }))
+        );
+      } else {
+        console.log('[ILL-diag ' + tag + '] no Page_Validators on this page');
+      }
+    }
+
+    function fillForm(opts) {
+      FIELDS.forEach((f) => setVal(f, payload[f], opts));
+      refreshValidators();
+      diagnose(opts && opts.onlyIfEmpty ? 'post-postback' : 'initial');
+
+      // Verify a beat later — if a widget wiped our value, we want it in the
+      // log rather than discovered by a puzzled human at submit time.
+      setTimeout(() => {
+        const el = findField('pubdate');
+        if (!el) {
+          console.warn('[ILL-autofill] pubdate element vanished after fill (DOM re-rendered?)');
+        } else if (el.value !== payload.pubdate) {
+          console.warn(
+            '[ILL-autofill] pubdate was overwritten after fill! expected',
+            payload.pubdate,
+            'got',
+            JSON.stringify(el.value),
+            '- re-asserting'
+          );
+          setVal('pubdate', payload.pubdate);
+        }
+      }, 800);
+    }
+
+    // Last line of defence: re-assert every value the instant before the POST
+    // leaves the browser. Defeats stale validator verdicts, widgets that clear
+    // themselves on blur, and desynced ClientState — whatever the actual
+    // culprit turns out to be, it does not get a second chance here.
+    function armSubmitGuard() {
+      const form = document.querySelector('form');
+      if (form) {
+        form.addEventListener(
+          'submit',
+          () => {
+            console.log('[ILL-autofill] submit guard: re-asserting values');
+            FIELDS.forEach((f) => setVal(f, payload[f], { skipIfSame: true }));
+            diagnose('pre-submit');
+          },
+          true // capture phase, so we run before ASP.NET's own submit handler
+        );
+      }
+      // Most WebForms buttons never fire a plain submit — they call __doPostBack.
+      if (typeof W.__doPostBack === 'function' && !W.__doPostBack.__illWrapped) {
+        const orig = W.__doPostBack;
+        const wrapped = function (target, arg) {
+          console.log('[ILL-autofill] __doPostBack guard: re-asserting values');
+          FIELDS.forEach((f) => setVal(f, payload[f], { skipIfSame: true }));
+          diagnose('pre-postback');
+          return orig.apply(this, [target, arg]);
+        };
+        wrapped.__illWrapped = true;
+        W.__doPostBack = wrapped;
+      }
+    }
+
+    // If an UpdatePanel does a partial postback it replaces the DOM wholesale
+    // and our filled inputs cease to exist. Re-fill the blanks afterwards.
+    function armPostbackRefill() {
+      try {
+        const prm = W.Sys && W.Sys.WebForms && W.Sys.WebForms.PageRequestManager;
+        if (!prm || typeof prm.getInstance !== 'function') return;
+        prm.getInstance().add_endRequest(() => {
+          console.log('[ILL-autofill] async postback finished, re-filling empty fields');
+          fillForm({ onlyIfEmpty: true });
+          armSubmitGuard();
+        });
+      } catch (e) {
+        /* no UpdatePanels on this page, fine */
+      }
+    }
+
+    function start() {
+      fillForm(rawHash ? {} : { onlyIfEmpty: true });
+      armSubmitGuard();
+      armPostbackRefill();
+      // Clear the hash only AFTER filling, so a manual F5 still works via the
+      // sessionStorage copy.
+      if (location.hash) {
+        history.replaceState(null, '', location.pathname + location.search);
+        console.log('[ILL-autofill] done, cleared hash');
+      }
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', start);
+    } else {
+      start(); // DOM already parsed by the time our script ran
+    }
+  }
+})();
